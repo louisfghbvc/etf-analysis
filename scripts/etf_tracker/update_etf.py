@@ -20,7 +20,7 @@ ctx.check_hostname = False
 ctx.verify_mode = ssl.CERT_NONE
 headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36'}
 
-def fetch_etf_holdings_cmoney(etf_id):
+def _fetch_etf_holdings_cmoney_old(etf_id):
     """從 CMoney (理財寶) 使用 Puppeteer 無頭瀏覽器抓取完整 50 檔成分股"""
     print(f"正在透過無頭瀏覽器抓取 {etf_id} 的完整持股明細...")
     import subprocess
@@ -59,6 +59,77 @@ def fetch_etf_holdings_cmoney(etf_id):
         return None
 
 
+
+def fetch_etf_holdings_moneydj(etf_id):
+    """從 MoneyDJ 爬取 ETF 持股明細 (前十大)"""
+    import urllib.request
+    url = f"https://www.moneydj.com/ETF/X/Basic/Basic0007.xdjhtm?etfid={etf_id}.TW"
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, context=ctx) as res:
+            html = res.read().decode('utf-8')
+        import re
+        tables = re.findall(r'<table(.*?)>(.*?)</table>', html, re.DOTALL)
+        target_table = None
+        for attrs, content in tables:
+            if "個股名稱" in content and "持有股數" in content:
+                target_table = content
+                break
+        if not target_table: return None
+        rows = re.findall(r'<tr.*?>(.*?)</tr>', target_table, re.DOTALL)
+        holdings = {}
+        for r in rows[1:]:
+            cells = re.findall(r'<t[dh].*?>(.*?)</t[dh]>', r, re.DOTALL)
+            clean_cells = [re.sub(r'<.*?>', '', c).strip().replace('&nbsp;', '').replace('\n', '').replace('\r', '') for c in cells]
+            if len(clean_cells) >= 3:
+                raw_name = clean_cells[0]
+                match = re.match(r'(.*?)\((.*?)\.TW\)', raw_name)
+                if match:
+                    name = match.group(1).strip()
+                    ticker = match.group(2).strip()
+                else:
+                    match = re.search(r'\((.*?)\.', raw_name)
+                    ticker = match.group(1).strip() if match else raw_name
+                    name = re.sub(r'\(.*?\)', '', raw_name).strip()
+                weight = float(clean_cells[1].replace(',', ''))
+                shares = float(clean_cells[2].replace(',', ''))
+                holdings[ticker] = {"name": name, "weight": weight, "shares": shares}
+        print(f"✅ {etf_id}: MoneyDJ 降級抓取 {len(holdings)} 檔成分股！")
+        return holdings
+    except Exception as e:
+        print(f"❌ MoneyDJ 抓取失敗: {e}")
+        return None
+
+
+def fetch_etf_holdings_fallback(etf_id):
+    """自動降級機制: 先試 CMoney (50檔)，若超時或失敗則降級 MoneyDJ (10檔)"""
+    # 1. 嘗試 CMoney
+    print(f"正在透過無頭瀏覽器抓取 {etf_id} 的完整持股明細...")
+    import subprocess
+    import json
+    script_path = "/home/louisfghbvc/.openclaw/workspace/scripts/etf_tracker/crawler.js"
+    cmd = ["node", script_path, etf_id]
+    
+    try:
+        # 給 30 秒 Timeout
+        result = subprocess.run(cmd, cwd="/tmp", capture_output=True, text=True, timeout=20)
+        if result.returncode == 0:
+            output_lines = result.stdout.strip().split('\n')
+            for line in output_lines:
+                if line.startswith("{") and line.endswith("}"):
+                    holdings = json.loads(line)
+                    if len(holdings) > 10:
+                        print(f"✅ {etf_id}: CMoney 成功抓取 {len(holdings)} 檔完整成分股！")
+                        return holdings
+    except subprocess.TimeoutExpired:
+        print(f"⚠️ CMoney 無頭瀏覽器抓取超時！")
+    except Exception as e:
+        print(f"⚠️ CMoney 抓取錯誤: {e}")
+        
+    # 2. 降級 MoneyDJ
+    print(f"⚠️ {etf_id} 啟動降級機制 -> 抓取 MoneyDJ 前十大持股...")
+    return fetch_etf_holdings_moneydj(etf_id)
+
 def fetch_all_prices():
     """從 TWSE (上市) 和 TPEx (上櫃) OpenAPI 抓取今日全市場收盤價"""
     print("📡 正在抓取全市場上市櫃收盤價 (計算投信建倉成本用)...")
@@ -68,7 +139,7 @@ def fetch_all_prices():
     twse_url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
     try:
         req = urllib.request.Request(twse_url, headers=headers)
-        with urllib.request.urlopen(req, context=ctx) as res:
+        with urllib.request.urlopen(req, context=ctx, timeout=10) as res:
             data = json.loads(res.read().decode('utf-8'))
             for item in data:
                 price_str = item.get('ClosingPrice', '').strip()
@@ -85,7 +156,7 @@ def fetch_all_prices():
     tpex_url = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes"
     try:
         req = urllib.request.Request(tpex_url, headers=headers)
-        with urllib.request.urlopen(req, context=ctx) as res:
+        with urllib.request.urlopen(req, context=ctx, timeout=10) as res:
             data = json.loads(res.read().decode('utf-8'))
             for item in data:
                 price_str = item.get('Close', '').strip()
@@ -317,7 +388,7 @@ def main():
     # 1. 抓取今日 ETF 持股資料
     daily_data = {}
     for etf_id in ETF_TICKERS:
-        holdings = fetch_etf_holdings_cmoney(etf_id)
+        holdings = fetch_etf_holdings_fallback(etf_id)
         if holdings:
             daily_data[etf_id] = holdings
             
